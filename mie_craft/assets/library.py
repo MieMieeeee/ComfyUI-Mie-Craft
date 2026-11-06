@@ -42,13 +42,34 @@ import tempfile
 from pathlib import Path
 
 # Plugin package root: nodes/assets/library.py -> nodes/assets -> nodes -> root.
-#: The plugin root the library resolves its bundled assets against. A
-#: ComfyUI pack that ships its own bundled assets sets MIE_PLUGIN_ROOT to
-#: its own root before the library is used; otherwise the core's own root
-#: is used.
+#: The plugin root the library resolves its bundled assets against, when
+#: nothing else says otherwise. This is the FALLBACK - see
+#: resolve_plugin_root().
 PLUGIN_ROOT = Path(
     os.environ.get("MIE_PLUGIN_ROOT")
     or Path(__file__).resolve().parents[2])
+
+
+def resolve_plugin_root():
+    """The plugin root the library resolves against, read NOW.
+
+    A ComfyUI pack that ships its own bundled assets sets MIE_PLUGIN_ROOT
+    to its own root. That has to be read at CALL time, not at import time:
+    two packs share this module, and whichever one imported it first would
+    otherwise freeze the root for everybody. The engine pack loads before
+    MieNodes (its directory name sorts earlier), so the import-time value
+    was the package's own - site-packages - and the user's library
+    resolved to a directory that does not exist.
+
+    PLUGIN_ROOT stays a plain attribute so a test can point the library
+    somewhere else. The name is not plugin_root() on purpose: the
+    resolvers below take a plugin_root argument, and a same-named
+    function would be shadowed by it.
+    """
+    override = os.environ.get("MIE_PLUGIN_ROOT")
+    if override:
+        return Path(override).resolve()
+    return PLUGIN_ROOT
 
 NAME_MAX_CHARS = 40
 APPEARANCE_MAX_CHARS = 800
@@ -110,13 +131,13 @@ BUNDLED_DIRNAME = "bundled_assets"
 
 def fixed_library_root(plugin_root=None):
     """The machine's fixed library root: <plugin>/asset_library."""
-    root = Path(plugin_root).resolve() if plugin_root is not None else PLUGIN_ROOT
+    root = Path(plugin_root).resolve() if plugin_root is not None else resolve_plugin_root()
     return root / LIBRARY_DIRNAME
 
 
 def bundled_library_root(plugin_root=None):
     """The read-only assets shipped inside the plugin: <plugin>/bundled_assets."""
-    root = Path(plugin_root).resolve() if plugin_root is not None else PLUGIN_ROOT
+    root = Path(plugin_root).resolve() if plugin_root is not None else resolve_plugin_root()
     return root / BUNDLED_DIRNAME
 
 
@@ -133,7 +154,7 @@ def _migrate_legacy_home_library_once(target, plugin_root):
     legacy = Path(os.path.expanduser("~")) / LEGACY_HOME_DIRNAME
     if not legacy.is_dir():
         return
-    if (Path(plugin_root).resolve() if plugin_root is not None else PLUGIN_ROOT) in legacy.parents:
+    if (Path(plugin_root).resolve() if plugin_root is not None else resolve_plugin_root()) in legacy.parents:
         return  # paranoia: legacy somehow inside the plugin — impossible, skip
     try:
         import shutil

@@ -5,4 +5,4 @@ assembler, the continuity critic and the dialogue pacing: everything that
 turns an asset into a plan.
 """
 
-__version__ = "0.1.3"
+__version__ = "0.1.4"
