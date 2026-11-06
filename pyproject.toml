@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "comfyui-mie-craft"
+description = "Mie's creation line: the character and scene library, the script contract, the zero-LLM plan assembler, the continuity critic, and the dialogue pacing."
+version = "0.1.0"
+license = "GPL-3.0"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "comfyui-mie-llm>=0.1.0",
+    "comfyui-mie-prompt>=0.1.0",
+]
+
+[tool.setuptools]
+packages = [
+    "mie_craft",
+    "mie_craft.assets",
+    "mie_craft.script",
+]
