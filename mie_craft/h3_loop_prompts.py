@@ -1414,10 +1414,26 @@ def build_fallback_shot_lines(
             label = f"<{slot}>: " if slot else ""
             subject_lines.append(f"{label}{about}")
             if schema == SCHEMA_SIX and slot:
-                retention_lines.append(
-                    f"<{slot}>: reference - use as the destination "
-                    "environment; do not copy a final pose."
-                )
+                if slot.startswith("Video "):
+                    # 2026-11-09 review F7+F6: a video slot is a motion
+                    # source, not a destination environment. Upstream
+                    # visual marker for transferring a performance across
+                    # identities/settings is attribute_transfer; a
+                    # performance that plays out over time is never
+                    # "partially_preserved" (upstream §4.1).
+                    retention_lines.append(
+                        f"<{slot}>: attribute_transfer - choreography and "
+                        "performance timing transfer to this clip's own "
+                        "cast and setting; identity, wardrobe, "
+                        "environment, and camera are not transferred. A "
+                        "performance that plays out over time is never "
+                        "'partially_preserved'."
+                    )
+                else:
+                    retention_lines.append(
+                        f"<{slot}>: reference - use as the destination "
+                        "environment; do not copy a final pose."
+                    )
     if not subject_lines:
         subject_lines = [
             "The characters keep the appearance already established for this clip."
@@ -2818,8 +2834,12 @@ def build_reference_directive(
                 "unless this scene's description says otherwise; describe "
                 "this scene's own environment and camera in "
                 "detailed_description. retention_analysis must list the "
-                "video slot as the motion source ('reference - choreography "
-                "and timing')."
+                "video slot as 'attribute_transfer - choreography and "
+                "timing': the performance transfers to this scene's own "
+                "cast and setting, while identity, wardrobe, environment, "
+                "and camera are NOT transferred. A motion or performance "
+                "that plays out over time is never 'partially_preserved' - "
+                "the transfer is whole or absent."
             )
         # Category-driven contracts. category is a single code string;
         # the user picks it via the category widget. Only dialogue
@@ -3616,7 +3636,66 @@ def offscreen_speech_line(
     return f"{head} {spoken} {'; '.join(clauses)}."
 
 
-def presence_summary(
+def reference_relation_sentence(
+    manifest: Optional[list[dict]],
+    referenced_pictures: Optional[set] = None,
+) -> str:
+    """F4 (2026-11-09 review): ONE summary sentence stating the clip's
+    reference relations, built ONLY from labels the manifest already
+    defines (identity pairs use the same 1-based identity order as the
+    fallback / repair paths). Empty string when the manifest carries no
+    usable slots — callers then append nothing and the summary keeps its
+    historical bytes. Spoken content never enters this sentence.
+
+    ``referenced_pictures`` mirrors validate_label_policy: when the
+    concept names specific pictures, identity Subjects bound to pictures
+    OUTSIDE that set are not taught to the scene — the summary must not
+    bind them either (2026-11-09 live test: Subjects 4/5 of a
+    duplicated figurine picture leaked into shot 3's summary). Subject
+    numbering keeps the unfiltered manifest identity order.
+    """
+    pairs: list[str] = []
+    environments: list[str] = []
+    videos: list[str] = []
+    subject_k = 0
+    for item in manifest or []:
+        slot = str(item.get("slot") or "").strip()
+        if not slot:
+            continue
+        role = str(item.get("role") or "").strip().lower()
+        if role == "identity":
+            subject_k += 1
+            if referenced_pictures and slot.startswith("Picture "):
+                try:
+                    pic_num = int(slot.split(" ", 1)[1])
+                except (IndexError, ValueError):
+                    pic_num = -1
+                if pic_num not in referenced_pictures:
+                    continue
+            pairs.append(f"<Subject {subject_k}> -> <{slot}>")
+        elif slot.startswith("Video "):
+            videos.append(f"<{slot}>")
+        else:
+            environments.append(f"<{slot}>")
+    clauses: list[str] = []
+    if pairs:
+        clauses.append(
+            " and ".join(pairs) + " bind identity and appearance"
+        )
+    if environments:
+        clauses.append(
+            " and ".join(environments) + " set the destination environment"
+        )
+    if videos:
+        clauses.append(
+            " and ".join(videos) + " supply choreography and timing only"
+        )
+    if not clauses:
+        return ""
+    return "Reference relations: " + "; ".join(clauses) + "."
+
+
+def _presence_summary_base(
     *,
     on_screen_names: list[str],
     speaking_names: list[str],
@@ -3669,6 +3748,28 @@ def presence_summary(
         f"{vis_phrase} {vis_verb} visible in the frame, listening; "
         f"{off_clause}. The spoken words are not restated here."
     )
+
+
+def presence_summary(
+    *,
+    on_screen_names: list[str],
+    speaking_names: list[str],
+    offscreen_names: list[str],
+    reference_sentence: Optional[str] = None,
+) -> str:
+    """Public presence summary: the historical sentence, plus (F4,
+    2026-11-09 review) ONE appended reference-relation sentence when the
+    caller passes one. The base sentence is kept byte-for-byte — the
+    relation sentence is appended, never merged into or rewriting it.
+    """
+    base = _presence_summary_base(
+        on_screen_names=on_screen_names,
+        speaking_names=speaking_names,
+        offscreen_names=offscreen_names,
+    )
+    if reference_sentence:
+        return f"{base} {reference_sentence}"
+    return base
 
 
 # Chinese action sentences next to a <d> line get spoken. Wrapping them
@@ -3845,7 +3946,8 @@ def install_presence_speech(
     spatial_layout: Optional[dict] = None, speaker_identities: Optional[dict] = None,
     absent: Optional[list[str]] = None, camera_perspective: str = "observer",
     picture_cues: Optional[list[str]] = None, opening_setting: Optional[list[str]] = None,
-    schema: str = SCHEMA_SIX,
+    schema: str = SCHEMA_SIX, manifest: Optional[list[dict]] = None,
+    referenced_pictures: Optional[set] = None,
 ) -> list[str]:
     """Shared V2/V3 presence assembly; speech is already locked as data."""
     off = set(offscreen_names)
@@ -3895,6 +3997,8 @@ def install_presence_speech(
         summary = presence_summary(
             on_screen_names=visible, speaking_names=speaking,
             offscreen_names=[n for n in _unique_names(line_speakers) if n in off],
+            reference_sentence=reference_relation_sentence(
+                manifest, referenced_pictures) or None,
         )
         lines = _replace_section_body(lines, "summary:", [summary, ""])
         lines = annotate_retention_pose(lines)
@@ -3917,6 +4021,8 @@ def install_shot_speech(
     duration_seconds: float = 0.0,
     clip_index: int = 1,
     voiceover: bool = False,
+    manifest: Optional[list[dict]] = None,
+    referenced_pictures: Optional[set] = None,
 ) -> list[str]:
     """Put speech sentences in the description, identity somewhere else.
 
@@ -4027,6 +4133,12 @@ def install_shot_speech(
                     "The spoken words are not restated here."
                 )
             sound = ""
+        # F4 (2026-11-09 review): append ONE reference-relation sentence
+        # built from manifest labels; the presence sentence above keeps
+        # its historical bytes.
+        ref_sentence = reference_relation_sentence(manifest, referenced_pictures)
+        if ref_sentence:
+            summary = f"{summary} {ref_sentence}"
         lines = _replace_section_body(lines, "summary:", [summary, ""])
         if sound:
             lines = _replace_section_body(lines, "overall_soundscape:", [sound, ""])

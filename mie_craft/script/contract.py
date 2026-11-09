@@ -663,6 +663,24 @@ def to_runtime(asset, *, wired_character_slots=(), wired_scene=False):
                 internal_shot += 1
                 lines.append("[Shot %d] %s, %s, %s. Cut directly to this framing within the same scene."
                              % (internal_shot, cuts[event["id"]].replace("_", " "), movement, perspective))
+                # 2026-11-09 review F5: a fixed, compiler-written state
+                # carry-over at the intra-segment cut. It names only
+                # asset-known state (who is on screen at this moment per
+                # the entrance/exit events already processed) and states
+                # the no-reset rule as categories — it never invents a
+                # pose or prop, and it never reuses execution
+                # visible_state (that field is the OPENING state, not
+                # this cut's end state).
+                on_cut = [names[r["id"]] for r in roles if r["id"] in visible]
+                if on_cut:
+                    lines.append(
+                        "Cut continuity: %s in the frame continue exactly as the action has reached them; positions, held props, and the scene carry over unchanged, and only the framing changes."
+                        % " and ".join(on_cut)
+                    )
+                else:
+                    lines.append(
+                        "Cut continuity: the scene continues exactly as the action has reached it; positions, held props, and the scene carry over unchanged, and only the framing changes."
+                    )
             who, kind = event["character"], event["type"]
             name = names[who]
             if kind == "dialogue":
