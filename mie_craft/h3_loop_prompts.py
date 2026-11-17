@@ -1785,6 +1785,23 @@ def build_plan(shot_entries: list[dict], prefix_lines: list[str]) -> dict:
     }
 
 
+def shot_list_errors(raw: dict) -> list[str]:
+    """Shared structure check for an authoring plan and a chain plan.
+
+    Both documents are a JSON object with a ``shots`` list. Prompt-section
+    rules stay in :func:`validate_plan` and apply only when a shot's prompt
+    is a list of section lines. The engine normalizer calls this so the
+    shot-list rule is not copied.
+    """
+    errors: list[str] = []
+    if not isinstance(raw, dict):
+        return ["plan must be a JSON object"]
+    shots = raw.get("shots")
+    if not isinstance(shots, list) or not (MIN_SHOTS <= len(shots) <= MAX_SHOTS):
+        errors.append(f"shots must be a list of {MIN_SHOTS}..{MAX_SHOTS} entries")
+    return errors
+
+
 def validate_plan(plan: dict, *, schema: str = SCHEMA_THREE) -> list[str]:
     """Return a list of contract violations (empty list = valid).
 
@@ -1808,9 +1825,9 @@ def validate_plan(plan: dict, *, schema: str = SCHEMA_THREE) -> list[str]:
         )
     if "shots" not in top:
         errors.append("top-level key 'shots' is required")
+    errors.extend(shot_list_errors(plan))
     shots = plan.get("shots")
-    if not isinstance(shots, list) or not (MIN_SHOTS <= len(shots) <= MAX_SHOTS):
-        errors.append(f"shots must be a list of {MIN_SHOTS}..{MAX_SHOTS} entries")
+    if any(item.startswith("shots must be") for item in errors):
         return errors
     # schema-specific prompt contract
     if schema == SCHEMA_SIX:

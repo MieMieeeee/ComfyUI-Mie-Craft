@@ -337,6 +337,107 @@ def _json_bytes(payload):
     return (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
 
 
+class AssetConflictError(Exception):
+    """The asset on disk is not the version the caller read.
+
+    Callers that send ``expected_hash`` get this instead of a silent
+    overwrite. The hash is the bundle digest, not a file mtime.
+    """
+
+    def __init__(self, kind, name, current_hash):
+        super().__init__(
+            "%s %r changed since it was read (current %s)"
+            % (kind, name, current_hash or "absent")
+        )
+        self.kind = kind
+        self.name = name
+        self.current_hash = current_hash
+
+
+def _content_filename(blob: bytes, suffix: str) -> str:
+    return hashlib.sha256(blob).hexdigest() + suffix
+
+
+def _publish_immutable(blob: bytes, directory: Path, suffix: str) -> str:
+    """Write ``blob`` under its content hash. An existing file is left as-is."""
+    name = _content_filename(blob, suffix)
+    final = directory / name
+    if final.is_file():
+        return name
+    tmp = _write_temp_file(blob, directory)
+    try:
+        os.replace(tmp, final)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    return name
+
+
+def _safe_media_name(name):
+    if (not isinstance(name, str) or not name or "/" in name or "\\" in name
+            or name.startswith(".")):
+        raise ValueError("asset media name is not a single file name: %r" % (name,))
+    return name
+
+
+def _read_media_map(asset_dir: Path):
+    """The ``media`` object from character.json or scene.json, or None."""
+    for json_name in (CHARACTER_JSON_NAME, SCENE_JSON_NAME):
+        path = asset_dir / json_name
+        if not path.is_file():
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            return None
+        if isinstance(payload, dict) and isinstance(payload.get("media"), dict):
+            return payload["media"]
+        return None
+    return None
+
+
+def _bundle_digest(description, voice_or_ambience, image_blobs, audio_blobs) -> str:
+    digest = hashlib.sha256()
+    digest.update(str(description or "").encode("utf-8"))
+    digest.update(b"\0")
+    digest.update(str(voice_or_ambience or "").encode("utf-8"))
+    for blob in image_blobs or []:
+        digest.update(hashlib.sha256(blob).digest())
+    for blob in audio_blobs or []:
+        digest.update(hashlib.sha256(blob).digest())
+    return digest.hexdigest()
+
+
+def _acquire_asset_lock(directory: Path):
+    directory.mkdir(parents=True, exist_ok=True)
+    handle = open(directory / ".write.lock", "a+b")
+    handle.seek(0, os.SEEK_END)
+    if handle.tell() < 1:
+        handle.write(b"\0")
+        handle.flush()
+    handle.seek(0)
+    if os.name == "nt":
+        import msvcrt
+        msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+    else:
+        import fcntl
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    return handle
+
+
+def _release_asset_lock(handle) -> None:
+    try:
+        if os.name == "nt":
+            import msvcrt
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        handle.close()
+
+
 def _read_asset_json(json_path, text_fields):
     """Read and shape-check an asset JSON file. Raises with the absolute path.
 
@@ -391,11 +492,27 @@ def _png_dimensions(data: bytes):
 
 
 def _image_files(asset_dir: Path):
-    """Ordered image list: images/*.png (V2), else the single legacy file.
+    """Ordered image list: the json media manifest, else images/*.png, else legacy.
 
-    Returns list[(path, legacy: bool)] or raises a descriptive error for
-    over-cap sets. Missing entirely -> ValueError (callers turn it into the
-    right message)."""
+    A manifest names content-addressed files. Readers follow that list, so a
+    new picture that is already on disk is invisible until the json flips.
+    Returns list[(path, legacy: bool)]."""
+    media = _read_media_map(asset_dir)
+    if media is not None and isinstance(media.get("images"), list) and media["images"]:
+        images_dir = asset_dir / IMAGES_DIRNAME
+        listed = []
+        for name in media["images"]:
+            safe = _safe_media_name(name)
+            path = images_dir / safe
+            if not path.is_file():
+                raise ValueError(
+                    "%s lists %s but that file is missing" % (images_dir, safe))
+            listed.append((path, False))
+        if len(listed) > MAX_IMAGES:
+            raise ValueError(
+                "%s lists %d images; an asset supports at most %d"
+                % (images_dir, len(listed), MAX_IMAGES))
+        return listed
     images_dir = asset_dir / IMAGES_DIRNAME
     if images_dir.is_dir():
         pngs = sorted(
@@ -422,8 +539,38 @@ def _image_files(asset_dir: Path):
 def _audio_files(char_dir: Path):
     """Ordered audio list: audio/*.{wav,mp3} (V2), else the legacy sample.
 
-    Returns list[path]. Same index in both extensions is an ambiguous error.
+    Returns list[path]. A media.audio list (possibly empty) wins over a
+    directory scan. Same index in both extensions is an ambiguous error.
     Zero clips is legal for a character."""
+    media = _read_media_map(char_dir)
+    if media is not None and "audio" in media:
+        names = media.get("audio") or []
+        if not isinstance(names, list):
+            raise ValueError("media.audio must be a list")
+        audio_dir = char_dir / AUDIO_DIRNAME
+        listed = []
+        for name in names:
+            safe = _safe_media_name(name)
+            path = audio_dir / safe
+            if not path.is_file():
+                raise ValueError(
+                    "%s lists %s but that file is missing" % (audio_dir, safe))
+            listed.append(path)
+        if len(listed) > MAX_AUDIO:
+            raise ValueError(
+                "%s lists %d clips; an asset supports at most %d"
+                % (audio_dir, len(listed), MAX_AUDIO))
+        if audio_dir.is_dir():
+            known = set(names)
+            extras = [
+                p.name for p in audio_dir.iterdir()
+                if p.is_file() and p.name not in known
+            ]
+            if extras:
+                raise ValueError(
+                    "ambiguous audio under %s: unlisted %s"
+                    % (audio_dir, ", ".join(sorted(extras))))
+        return listed
     audio_dir = char_dir / AUDIO_DIRNAME
     if audio_dir.is_dir():
         by_stem: dict = {}
@@ -481,6 +628,7 @@ def _validate_same_size(entries):
 def save_character(
     library_dir, name, description, voice,
     png_bytes_list=None, wav_bytes_list=None, plugin_root=None,
+    expected_hash=None,
 ):
     """Write one character in the V2 layout (plan section 4).
 
@@ -586,72 +734,91 @@ def save_character(
     json_path = target_dir / CHARACTER_JSON_NAME
     json_payload = {"name": target_dir.name, "description": d, "voice": v}
 
-    tmp_files = []  # (tmp_path, final_path)
+    lock = _acquire_asset_lock(target_dir)
     try:
+        if expected_hash is not None:
+            current_hash = None
+            if json_path.is_file():
+                try:
+                    loaded_now = load_character(
+                        library_dir, target_dir.name, plugin_root=plugin_root)
+                    current_hash = _digest_loaded_character(loaded_now)
+                except (OSError, ValueError, FileNotFoundError):
+                    current_hash = None
+            if current_hash != expected_hash:
+                raise AssetConflictError("character", target_dir.name, current_hash)
+        image_names = None
+        audio_names = None
         if png_bytes_list is not None:
             images_dir.mkdir(parents=True, exist_ok=True)
-            for i, blob in enumerate(png_bytes_list, 1):
-                tmp = _write_temp_file(blob, images_dir)
-                tmp_files.append((tmp, images_dir / ("%02d.png" % i)))
+            image_names = [
+                _publish_immutable(blob, images_dir, ".png")
+                for blob in png_bytes_list
+            ]
         if wav_bytes_list is not None:
             audio_dir.mkdir(parents=True, exist_ok=True)
-            for i, blob in enumerate(wav_bytes_list, 1):
-                tmp = _write_temp_file(blob, audio_dir)
-                tmp_files.append((tmp, audio_dir / ("%02d.wav" % i)))
+            audio_names = [
+                _publish_immutable(blob, audio_dir, ".wav")
+                for blob in wav_bytes_list
+            ]
         if legacy_audio_promotion is not None:
             src, dst_name = legacy_audio_promotion
             audio_dir.mkdir(parents=True, exist_ok=True)
-            tmp = _write_temp_file(src.read_bytes(), audio_dir)
-            tmp_files.append((tmp, audio_dir / dst_name))
+            audio_names = [_publish_immutable(
+                src.read_bytes(), audio_dir, Path(dst_name).suffix or ".wav")]
+        previous_media = _read_media_map(target_dir) or {}
+        media = dict(previous_media)
+        if image_names is not None:
+            media["images"] = image_names
+        if audio_names is not None:
+            media["audio"] = audio_names
+        if media:
+            json_payload["media"] = media
         tmp_json = _write_temp_file(_json_bytes(json_payload), target_dir)
-        replaced = []
         try:
-            for tmp, final in tmp_files:
-                os.replace(tmp, final)
-                replaced.append(final)
             os.replace(tmp_json, json_path)
         except OSError as e:
+            tmp_json.unlink(missing_ok=True)
             raise OSError(
-                "character.json/files replacement failed (%s). Replaced so "
-                "far: %s; saving %r again successfully rewrites everything."
-                % (e, ", ".join(p.name for p in replaced) or "none", target_dir.name)
+                "character.json replacement failed (%s); saving %r again "
+                "rewrites the manifest. Media already stored under its "
+                "content hash is left in place."
+                % (e, target_dir.name)
             ) from e
+        if image_names is not None and images_dir.is_dir():
+            keep = set(image_names)
+            for path in images_dir.iterdir():
+                if path.is_file() and path.name not in keep:
+                    path.unlink()
+        if audio_names is not None and audio_dir.is_dir():
+            keep = set(audio_names)
+            for path in audio_dir.iterdir():
+                if path.is_file() and path.name not in keep:
+                    path.unlink()
+        for legacy in (LEGACY_PORTRAIT_NAME,) + LEGACY_VOICE_SAMPLE_NAMES:
+            (target_dir / legacy).unlink(missing_ok=True)
+        images = _image_files(target_dir)
+        audios = _audio_files(target_dir)
+        image_blobs = [p.read_bytes() for p, _legacy in images]
+        audio_blobs = [p.read_bytes() for p in audios]
+        return {
+            "name": target_dir.name,
+            "description": d,
+            "voice": v,
+            "status": status,
+            "content_hash": _bundle_digest(d, v, image_blobs, audio_blobs),
+            "png_bytes_list": image_blobs,
+            "audio_bytes_list": audio_blobs,
+            "audio_exts": [p.suffix for p in audios],
+        }
     finally:
-        for tmp, _final in tmp_files:
-            tmp.unlink(missing_ok=True)
+        _release_asset_lock(lock)
 
-    # Post-commit cleanup: superseded files only ever die after the JSON
-    # landed, so a failed save cannot destroy the previous asset.
-    if png_bytes_list is not None:
-        keep = {"%02d.png" % i for i in range(1, len(png_bytes_list) + 1)}
-        if images_dir.is_dir():
-            for p in images_dir.iterdir():
-                if p.is_file() and p.name not in keep:
-                    p.unlink()
-    if wav_bytes_list is not None or legacy_audio_promotion is not None:
-        keep = {"%02d.wav" % i for i in range(1, (len(wav_bytes_list) if wav_bytes_list else 0) + 1)}
-        if legacy_audio_promotion is not None:
-            keep.add(legacy_audio_promotion[1])
-        if audio_dir.is_dir():
-            for p in audio_dir.iterdir():
-                if p.is_file() and p.name not in keep:
-                    p.unlink()
-    # The first new-format save retires the legacy single files (their
-    # content was promoted above whenever it should survive).
-    for legacy in (LEGACY_PORTRAIT_NAME,) + LEGACY_VOICE_SAMPLE_NAMES:
-        (target_dir / legacy).unlink(missing_ok=True)
 
-    images = _image_files(target_dir)
-    audios = _audio_files(target_dir)
-    return {
-        "name": target_dir.name,
-        "description": d,
-        "voice": v,
-        "status": status,
-        "png_bytes_list": [p.read_bytes() for p, _l in images],
-        "audio_bytes_list": [p.read_bytes() for p in audios],
-        "audio_exts": [p.suffix for p in audios],
-    }
+def _digest_loaded_character(loaded) -> str:
+    return _bundle_digest(
+        loaded.get("description"), loaded.get("voice"),
+        loaded.get("png_bytes_list"), loaded.get("audio_bytes_list"))
 
 
 
@@ -949,7 +1116,7 @@ def _character_entry_problem(entry):
 
 
 def save_scene(library_dir, name, description, png_bytes_list=None,
-              ambience=None, plugin_root=None):
+              ambience=None, plugin_root=None, expected_hash=None):
     """Write one scene in the V2 layout. Same keep/replace commit shape as
     save_character, minus audio (scenes have none).
 
@@ -1043,43 +1210,66 @@ def save_scene(library_dir, name, description, png_bytes_list=None,
     if resolved_ambience:
         json_payload["ambience"] = resolved_ambience
 
-    tmp_files = []
+    lock = _acquire_asset_lock(target_dir)
     try:
+        if expected_hash is not None:
+            current_hash = None
+            if json_path.is_file():
+                try:
+                    loaded_now = load_scene(
+                        library_dir, target_dir.name, plugin_root=plugin_root)
+                    current_hash = _bundle_digest(
+                        loaded_now.get("description"),
+                        loaded_now.get("ambience"),
+                        loaded_now.get("png_bytes_list"),
+                        [],
+                    )
+                except (OSError, ValueError, FileNotFoundError):
+                    current_hash = None
+            if current_hash != expected_hash:
+                raise AssetConflictError("scene", target_dir.name, current_hash)
+        image_names = None
         if png_bytes_list is not None:
             images_dir.mkdir(parents=True, exist_ok=True)
-            for i, blob in enumerate(png_bytes_list, 1):
-                tmp = _write_temp_file(blob, images_dir)
-                tmp_files.append((tmp, images_dir / ("%02d.png" % i)))
+            image_names = [
+                _publish_immutable(blob, images_dir, ".png")
+                for blob in png_bytes_list
+            ]
+        previous_media = _read_media_map(target_dir) or {}
+        if image_names is None and isinstance(previous_media.get("images"), list):
+            image_names = list(previous_media["images"])
+        if image_names is not None:
+            media = dict(previous_media)
+            media["images"] = image_names
+            json_payload["media"] = media
         tmp_json = _write_temp_file(_json_bytes(json_payload), target_dir)
         try:
-            for tmp, final in tmp_files:
-                os.replace(tmp, final)
             os.replace(tmp_json, json_path)
         except OSError as e:
+            tmp_json.unlink(missing_ok=True)
             raise OSError(
-                "scene.json/files replacement failed (%s); saving %r again "
-                "successfully rewrites everything." % (e, target_dir.name)
+                "scene.json replacement failed (%s); saving %r again "
+                "rewrites the manifest." % (e, target_dir.name)
             ) from e
+        if image_names is not None and images_dir.is_dir():
+            keep = set(image_names)
+            for path in images_dir.iterdir():
+                if path.is_file() and path.name not in keep:
+                    path.unlink()
+        (target_dir / LEGACY_SCENE_IMAGE_NAME).unlink(missing_ok=True)
+        images = _image_files(target_dir)
+        image_blobs = [p.read_bytes() for p, _legacy in images]
+        return {
+            "name": target_dir.name,
+            "description": d,
+            "ambience": resolved_ambience or "",
+            "status": status,
+            "content_hash": _bundle_digest(
+                d, resolved_ambience or "", image_blobs, []),
+            "png_bytes_list": image_blobs,
+        }
     finally:
-        for tmp, _final in tmp_files:
-            tmp.unlink(missing_ok=True)
-
-    if png_bytes_list is not None:
-        keep = {"%02d.png" % i for i in range(1, len(png_bytes_list) + 1)}
-        if images_dir.is_dir():
-            for p in images_dir.iterdir():
-                if p.is_file() and p.name not in keep:
-                    p.unlink()
-    (target_dir / LEGACY_SCENE_IMAGE_NAME).unlink(missing_ok=True)
-
-    images = _image_files(target_dir)
-    return {
-        "name": target_dir.name,
-        "description": d,
-        "ambience": resolved_ambience or "",
-        "status": status,
-        "png_bytes_list": [p.read_bytes() for p, _l in images],
-    }
+        _release_asset_lock(lock)
 
 
 
