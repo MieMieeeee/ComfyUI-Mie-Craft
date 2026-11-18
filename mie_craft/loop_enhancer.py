@@ -1113,4 +1113,3 @@ def _build_advice(
         if note:
             parts.append(note)
     return "\n".join(parts)
-

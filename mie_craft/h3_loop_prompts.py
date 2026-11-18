@@ -34,28 +34,13 @@ from typing import Any, Optional
 
 from mie_prompt.prompts.loader import load_prompt_text
 
-try:
-    from mie_prompt.h3_prompts import (
-        category_advice,
-        parse_category,
-        system_t2v_prompt,
-        system_reference_prompt,
-    )
-except ImportError:
-    from mie_prompt.h3_prompts import (
-        category_advice,
-        parse_category,
-        system_t2v_prompt,
-        system_reference_prompt,
-    )
-
-try:
-    from _mienodes_internal.core.utils import mie_log
-except ImportError:
-    try:
-        from mie_llm.utils import mie_log
-    except ImportError:
-        from core.utils import mie_log
+from mie_prompt.h3_prompts import (
+    category_advice,
+    parse_category,
+    system_t2v_prompt,
+    system_reference_prompt,
+)
+from mie_llm.utils import mie_log
 
 
 # --------------------------------------------------------------------------- #
@@ -4992,4 +4977,3 @@ def _check_segment(
                 f"'{speaker}' must state the voice identity (gender + "
                 f"pitch + timbre) beside the ({sid}) tag"
             )
-

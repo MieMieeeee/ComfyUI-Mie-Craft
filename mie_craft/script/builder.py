@@ -1712,5 +1712,3 @@ def storyboard_cache_key(storyboard: dict) -> str:
     except Exception:
         return _library.MISSING_CACHE_MARKER
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-
